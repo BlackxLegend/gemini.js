@@ -1,0 +1,360 @@
+/** @format */
+
+const fs = require('fs');
+const { v4: uuid } = require('uuid');
+const path = require('path');
+const fetch = require('node-fetch');
+const {
+  GoogleGenerativeAI,
+  HarmCategory,
+  DynamicRetrievalMode,
+  HarmBlockThreshold,
+} = require('@google/generative-ai');
+const { GoogleAIFileManager } = require('@google/generative-ai/server');
+
+// 🔐 API Key directly embedded (Replace with your own if needed)
+const apiKey = 'AIzaSyC1g9j1zu0BdSHOmAZGIGMehBXUQL4xTCI';
+const genAI = new GoogleGenerativeAI(apiKey);
+const fileManager = new GoogleAIFileManager(apiKey);
+
+const systemInstruction =
+  'You’re Maz, A bot by Jsux and Tanvir. Be helpful, You are not affiliated with Google in any way. Always keep your responses short and concise.';
+const temperature = 0.15;
+
+if (!global.temp) global.temp = {};
+if (!global.temp.gemini) global.temp.gemini = {};
+const { gemini } = global.temp;
+
+module.exports = {
+  config: {
+    name: 'gemini',
+    version: '3.0',
+    role: 0,
+    price: {
+      price: 850,
+      required: false,
+    },
+    countDown: 15,
+    author: 'Jsus',
+    shortDescription: { en: 'Google Gemini Pro ChatBot' },
+    longDescription: { en: 'Google Gemini Pro ChatBot' },
+    category: 'ai',
+    guide: {
+      en: '{pn} [<prompt> | <image Reply> | <audio Reply>] | <video Reply>',
+    },
+  },
+
+  onStart: async ({ message, args, event }) => {
+    if (!args[0]) return message.SyntaxError();
+    if (args[0].toLowerCase() === 'clear') {
+      gemini[event.senderID] = [];
+      return message.reply('Context Cleared');
+    }
+
+    if (event?.messageReply?.messageID) {
+      const repliedMessage = GoatBot.onReply.get(event?.messageReply?.messageID);
+      if (repliedMessage?.commandName) {
+        const blockedCommands = ['flag', 'waifubot', 'pokebot'];
+        if (blockedCommands.includes(repliedMessage.commandName))
+          return message.reply('No Cheating');
+      }
+    }
+
+    await message.reaction('⏳', event.messageID);
+
+    const attachmentType = event?.messageReply?.attachments[0]?.type;
+    const type =
+      attachmentType === 'photo'
+        ? 'imageReply'
+        : attachmentType === 'audio'
+        ? 'audioReply'
+        : attachmentType === 'video'
+        ? 'videoReply'
+        : 'text';
+
+    return await GeminiUse({
+      prompt: args.join(' '),
+      model: 'gemini-2.0-flash',
+      type,
+      event,
+      message,
+    });
+  },
+
+  onReply: async ({ message, event, Reply, args }) => {
+    if (event.senderID !== Reply.author) return;
+    if (event?.messageReply?.attachments[0] && !args[0])
+      return message.reply("You can't reply with just attachments");
+    if (!args[0]) return message.SyntaxError();
+    if (args[0].toLowerCase() === 'clear') {
+      global.GoatBot.onReply.delete(Reply.messageID);
+      gemini[event.senderID] = [];
+      return message.reply('Context Cleared');
+    }
+
+    await message.reaction('⏳', event.messageID);
+    global.GoatBot.onReply.delete(Reply.messageID);
+    return await GeminiUse({
+      prompt: args.join(' '),
+      model: 'gemini-2.0-flash',
+      type: 'text',
+      event,
+      message,
+    });
+  },
+};
+
+async function GeminiUse({ prompt, model, type, event, message }) {
+  try {
+    if (type === 'imageReply')
+      return await vision({ prompt, model, event, message });
+    if (type === 'audioReply')
+      return await audio({ prompt, model, event, message, isVid: false });
+    if (type === 'videoReply')
+      return await video({ prompt, model, event, message });
+    return await geminiText({ prompt, model, event, message });
+  } catch (error) {
+    message.error(error);
+  }
+}
+
+async function geminiText({ prompt, model, event, message }) {
+  gemini[event.senderID] = gemini[event.senderID] || [];
+  const chatBlock = [...gemini[event.senderID]];
+  const chatModel = await genAI.getGenerativeModel(
+    {
+      model,
+      systemInstruction,
+      tools: [
+        {
+          googleSearch: {},
+        },
+      ],
+    },
+    { apiVersion: 'v1beta' },
+  );
+
+  const chat = await chatModel.startChat({
+    history: chatBlock,
+    generationConfig: {
+      maxOutputTokens: 4096,
+      temperature,
+    },
+  });
+
+  const result = await chat.sendMessage(prompt);
+  const responseText = (await result.response.text()).replace(/\*/g, '');
+
+  gemini[event.senderID].push(
+    { role: 'user', parts: [{ text: prompt }] },
+    { role: 'model', parts: [{ text: responseText }] },
+  );
+
+  if (!responseText) {
+    gemini[event.senderID] = [];
+    await message.reaction('❌', event.messageID);
+    return message.reply('Context quota surpassed. Context cleared for a fresh start.');
+  }
+
+  await message.reaction('✅', event.messageID);
+  const reply = await message.reply(responseText);
+  global.GoatBot.onReply.set(reply.messageID, {
+    commandName: 'gemini',
+    messageID: reply.messageID,
+    author: event.senderID,
+    text: responseText,
+  });
+}
+
+async function vision({ prompt, model, event, message }) {
+  gemini[event.senderID] = gemini[event.senderID] || [];
+  const images = await Promise.all(
+    event.messageReply.attachments.map(item => urlToGenerativePart(item.url)),
+  );
+
+  const chatModel = await genAI.getGenerativeModel(
+    {
+      model,
+      systemInstruction,
+      safetySettings: [
+        { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.BLOCK_NONE },
+        { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_NONE },
+        { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.BLOCK_NONE },
+        { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_NONE },
+      ],
+      tools: [
+        {
+          googleSearch: {},
+        },
+      ],
+    },
+    { apiVersion: 'v1beta' },
+  );
+
+  const result = await chatModel.generateContent([prompt, ...images]);
+  const responseText = await result.response.text();
+  gemini[event.senderID].push(
+    { role: 'user', parts: [{ text: prompt }] },
+    { role: 'model', parts: [{ text: responseText }] },
+  );
+
+  await message.reaction('✅', event.messageID);
+  const ready = await message.reply(responseText);
+  global.GoatBot.onReply.set(ready.messageID, {
+    commandName: 'gemini',
+    messageID: ready.messageID,
+    author: event.senderID,
+    text: responseText,
+  });
+}
+
+async function audio({ prompt, model, event, message, isVid }) {
+  gemini[event.senderID] = gemini[event.senderID] || [];
+  const audioParts = await Promise.all(
+    event.messageReply.attachments.map(item => urlToGenerativePart(item.url, isVid)),
+  );
+
+  const chatModel = await genAI.getGenerativeModel(
+    {
+      model,
+      systemInstruction,
+      tools: [
+        {
+          googleSearch: {},
+        },
+      ],
+    },
+    { apiVersion: 'v1beta' },
+  );
+
+  const result = await chatModel.generateContent([prompt, ...audioParts]);
+  const responseText = await result.response.text();
+  gemini[event.senderID].push(
+    { role: 'user', parts: [{ text: prompt }] },
+    { role: 'model', parts: [{ text: responseText }] },
+  );
+
+  await message.reaction('✅', event.messageID);
+  const ready = await message.reply(responseText);
+  global.GoatBot.onReply.set(ready.messageID, {
+    commandName: 'gemini',
+    messageID: ready.messageID,
+    author: event.senderID,
+    text: responseText,
+  });
+}
+
+async function video({ prompt, model, event, message }) {
+  gemini[event.senderID] = gemini[event.senderID] || [];
+  const attachment = event.messageReply.attachments[0];
+  if (!attachment || !attachment.url)
+    throw new Error('No video attachment found.');
+
+  const tempDir = path.join(__dirname, 'tmp');
+  const fileName = `gemini_${uuid()}.webm`;
+  const tempFilePath = path.join(tempDir, fileName);
+
+  const response = await fetch(attachment.url);
+  if (!response.ok)
+    throw new Error(`Failed to download video: ${response.status} ${response.statusText}`);
+
+  const buffer = await response.buffer();
+  fs.writeFileSync(tempFilePath, buffer);
+
+  const uploadedFile = await uploadToGemini(tempFilePath, attachment.mimeType || 'video/webm');
+  await waitForFilesActive([uploadedFile]);
+
+  const chatModel = await genAI.getGenerativeModel(
+    {
+      model,
+      systemInstruction,
+      tools: [{ googleSearch: {} }],
+    },
+    { apiVersion: 'v1beta' },
+  );
+
+  const chatSession = chatModel.startChat({
+    generationConfig: {
+      temperature,
+      topP: 0.95,
+      topK: 40,
+      maxOutputTokens: 8192,
+      responseMimeType: 'text/plain',
+    },
+    history: [
+      {
+        role: 'user',
+        parts: [
+          {
+            fileData: {
+              mimeType: uploadedFile.mimeType,
+              fileUri: uploadedFile.uri,
+            },
+          },
+        ],
+      },
+    ],
+  });
+
+  const result = await chatSession.sendMessage(prompt);
+  const responseText = await result.response.text();
+  gemini[event.senderID].push(
+    { role: 'user', parts: [{ text: prompt }] },
+    { role: 'model', parts: [{ text: responseText }] },
+  );
+
+  await message.reaction('✅', event.messageID);
+  const reply = await message.reply(responseText);
+  global.GoatBot.onReply.set(reply.messageID, {
+    commandName: 'gemini',
+    messageID: reply.messageID,
+    author: event.senderID,
+    text: responseText,
+  });
+
+  fs.unlinkSync(tempFilePath);
+}
+
+async function uploadToGemini(filePath, mimeType) {
+  const uploadResult = await fileManager.uploadFile(filePath, {
+    mimeType,
+    displayName: filePath,
+  });
+  return uploadResult.file.id;
+}
+
+async function waitForFilesActive(files) {
+  for (const name of files.map(file => file.name)) {
+    let file = await fileManager.getFile(name);
+    while (file.state === 'PROCESSING') {
+      await new Promise(resolve => setTimeout(resolve, 7500));
+      file = await fileManager.getFile(name);
+    }
+    if (file.state !== 'ACTIVE')
+      throw new Error(`File ${file.name} failed to process`);
+  }
+}
+
+async function urlToGenerativePart(url, isVideo) {
+  if (!url) throw new Error('URL is required.');
+  const MAX_SIZE = 20971520;
+  const response = await fetch(url);
+  if (!response.ok)
+    throw new Error(`Failed to fetch the URL: ${response.status} ${response.statusText}`);
+
+  const contentLength = response.headers.get('content-length');
+  if (contentLength && parseInt(contentLength, 10) > MAX_SIZE)
+    throw new Error('The data size exceeds the maximum limit of 20 MB.');
+
+  const data = await response.buffer();
+  if (data.length > MAX_SIZE)
+    throw new Error('The downloaded data exceeds the maximum limit of 20 MB.');
+
+  const mimeType = response.headers.get('content-type');
+  return {
+    inlineData: {
+      data: data.toString('base64'),
+      mimeType: isVideo ? 'audio/mpeg' : mimeType,
+    },
+  };
+}
